@@ -26,10 +26,7 @@ const serviceAccount = {
   universe_domain: "googleapis.com",
 };
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,14 +37,14 @@ const BAE_CONFIG = {
   dev: {
     captureUrl: "https://merchant-order-token.baelab.net/v1/payments/capture-context",
     processUrl: "https://api.apps-console.bankaletihad.com/BAF3E974-52AA-7598-FF04-56945EF93500/045FCC75-62A0-EE53-FF87-4FD683745500/services/businessMarketplace/pay/hostedCheckout",
-    mitUrl:     "https://merchant-order-token.baelab.net/v1/payments/PLACEHOLDER_MIT_ENDPOINT", // ← confirm with BAE
+    mitUrl:     "https://merchant-order-token.baelab.net/v1/payments/PLACEHOLDER_MIT_ENDPOINT",
     authKey:    "MDAxMTUwOTkyOilFVj02UU1GX2RDVmdUYW4yUEd+NnBYaCNzRUtrbg==",
     companyId:  "A4B4A51F-0E6A-41BE-A8FB-5FCCA54C2F58",
   },
   prod: {
     captureUrl: "https://merchant-order-token.bankaletihad.com/v1/payments/app2/capture-context",
     processUrl: "https://api.apps-console.bankaletihad.com/BAF3E974-52AA-7598-FF04-56945EF93500/045FCC75-62A0-EE53-FF87-4FD683745500/services/businessMarketplace/pay/hostedCheckout",
-    mitUrl:     "https://merchant-order-token.bankaletihad.com/v1/payments/PLACEHOLDER_MIT_ENDPOINT", // ← confirm with BAE
+    mitUrl:     "https://merchant-order-token.bankaletihad.com/v1/payments/PLACEHOLDER_MIT_ENDPOINT",
     authKey:    "MDAxNjA4Njg3Ol8hI19MdjQqUnp1OUw1YzZoOVRFMnllfWNdNEtCMg==",
     companyId:  "6361F8DC-BCAE-4D4A-B903-7B8121A47922",
   },
@@ -64,12 +61,33 @@ const HEADERS = (authKey) => ({
 //  HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const todayString      = ()          => new Date().toISOString().split("T")[0];
-const futureDateString = (days = 1)  => {
+const todayString      = ()         => new Date().toISOString().split("T")[0];
+const futureDateString = (days = 1) => {
   const d = new Date();
   d.setDate(d.getDate() + days);
   return d.toISOString().split("T")[0];
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SHARED: Write a subscription record to Firestore
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function saveSubscriptionToFirestore({ customerTokenId, planAmount, environment }) {
+  const subId = "sub_" + Math.random().toString(36).substr(2, 9);
+  await db.collection("subscriptions").doc(subId).set({
+    userId:          subId,
+    customerTokenId,
+    planAmount,
+    currency:        "JOD",
+    status:          "active",
+    environment:     environment || "prod",
+    nextBillingDate: futureDateString(1),  // ← change to 30 for monthly production billing
+    createdAt:       admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt:       admin.firestore.FieldValue.serverTimestamp(),
+  });
+  console.log(`💾 Subscription saved to Firestore: ${subId} | token: ${customerTokenId} | amount: ${planAmount} JOD`);
+  return subId;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  EXPRESS APP
@@ -82,11 +100,12 @@ app.use(express.json());
 // ─────────────────────────────────────────────────────────────────────────────
 //  ROUTE 1: Capture Context Token
 //  POST /api/capture-context
-//  Body: { totalAmount, origin, environment, isSubscription }
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.post("/api/capture-context", async (req, res) => {
   const { totalAmount, origin, environment = "dev" } = req.body;
+  console.log(`\n📥 [capture-context] env=${environment} amount=${totalAmount} origin=${origin}`);
+
   const cfg = BAE_CONFIG[environment] ?? BAE_CONFIG.dev;
 
   try {
@@ -101,111 +120,118 @@ app.post("/api/capture-context", async (req, res) => {
     });
 
     const data = await baeRes.text();
+    console.log(`✅ [capture-context] BAE responded ${baeRes.status}`);
     return res.status(baeRes.status).send(data);
   } catch (err) {
+    console.error(`❌ [capture-context] Error:`, err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ROUTE 2: Process Final Payment
+//  ROUTE 2: Process Final Payment (standard card / 3DS path)
 //  POST /api/process-payment
 //  Body: { transientToken, environment, isSubscription, totalAmount }
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.post("/api/process-payment", async (req, res) => {
   const { transientToken, environment = "dev", isSubscription = false, totalAmount = "1.00" } = req.body;
+  console.log(`\n📥 [process-payment] env=${environment} isSubscription=${isSubscription} amount=${totalAmount}`);
+
   const cfg = BAE_CONFIG[environment] ?? BAE_CONFIG.dev;
 
   try {
     const baeRes = await fetch(cfg.processUrl, {
       method:  "POST",
       headers: HEADERS(cfg.authKey),
-      body: JSON.stringify({
-        token:     transientToken,
-        companyId: cfg.companyId,
-      }),
+      body: JSON.stringify({ token: transientToken, companyId: cfg.companyId }),
     });
 
     const rawData = await baeRes.text();
+    console.log(`✅ [process-payment] BAE responded ${baeRes.status}`);
+    console.log(`📦 [process-payment] BAE raw response: ${rawData}`);
 
-    // ── Save TMS token to Firestore if this is a subscription ─────────────────
-    if (isSubscription) {
+    // ── Save to Firestore if this is a subscription ───────────────────────────
+    if (isSubscription && baeRes.ok) {
       try {
         const parsed   = JSON.parse(rawData);
-        const tmsToken = parsed.customerTokenId || parsed.paymentToken;
+        // Log all keys so we can see exactly what BAE returns
+        console.log(`🔍 [process-payment] BAE response keys: ${Object.keys(parsed).join(", ")}`);
+
+        const tmsToken = parsed.customerTokenId
+          || parsed.paymentToken
+          || parsed.token
+          || parsed.instrumentIdentifier?.id
+          || null;
 
         if (tmsToken) {
-          const subId = "sub_" + Math.random().toString(36).substr(2, 9);
-          await db.collection("subscriptions").doc(subId).set({
-            userId:          subId,
-            customerTokenId: tmsToken,
-            planAmount:      totalAmount,
-            currency:        "JOD",
-            status:          "active",
-            environment,
-            nextBillingDate: futureDateString(1), // ← change to 30 for production
-            createdAt:       admin.firestore.FieldValue.serverTimestamp(),
-            updatedAt:       admin.firestore.FieldValue.serverTimestamp(),
-          });
-          console.log(`💾 Subscription saved to Firestore: ${subId}`);
+          await saveSubscriptionToFirestore({ customerTokenId: tmsToken, planAmount: totalAmount, environment });
+        } else {
+          console.warn(`⚠️ [process-payment] No token field found in BAE response. Cannot save subscription.`);
         }
       } catch (e) {
-        console.warn("Could not save subscription:", e.message);
+        console.error(`❌ [process-payment] Firestore save error:`, e.message);
       }
     }
 
     return res.status(baeRes.status).send(rawData);
   } catch (err) {
+    console.error(`❌ [process-payment] Error:`, err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ROUTE 3: Explicit CIT Save (called by frontend after first payment)
-//  POST /api/checkout-success
-//  Body: { userId, customerTokenId, planAmount, environment }
+//  ROUTE 3: Save Subscription (wallet / auto-authorized path)
+//  Called by frontend when Google Pay or Apple Pay auto-authorizes.
+//  The completeResult JWT from up.complete() is decoded server-side.
+//  POST /api/save-subscription
+//  Body: { completeResultJwt, totalAmount, environment }
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.post("/api/checkout-success", async (req, res) => {
-  const { userId, customerTokenId, planAmount, environment = "prod" } = req.body;
-
-  if (!userId || !customerTokenId || !planAmount) {
-    return res.status(400).json({ error: "Missing: userId, customerTokenId, planAmount" });
-  }
+app.post("/api/save-subscription", async (req, res) => {
+  const { completeResultJwt, totalAmount = "1.00", environment = "prod" } = req.body;
+  console.log(`\n📥 [save-subscription] env=${environment} amount=${totalAmount}`);
 
   try {
-    const docRef = await db.collection("subscriptions").add({
-      userId,
-      customerTokenId,
-      planAmount,
-      currency:        "JOD",
-      status:          "active",
-      environment,
-      nextBillingDate: futureDateString(1), // ← change to 30 for production
-      createdAt:       admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt:       admin.firestore.FieldValue.serverTimestamp(),
-    });
+    // Decode the JWT payload (second segment)
+    const payloadB64  = completeResultJwt.split(".")[1];
+    const decoded     = JSON.parse(Buffer.from(payloadB64, "base64").toString("utf8"));
 
-    console.log(`✅ Subscription created: ${docRef.id}`);
-    return res.status(201).json({
-      message:         "Subscription created.",
-      subscriptionId:  docRef.id,
-      nextBillingDate: futureDateString(1),
-    });
+    console.log(`🔍 [save-subscription] Decoded JWT keys: ${Object.keys(decoded).join(", ")}`);
+    console.log(`🔍 [save-subscription] Full decoded payload: ${JSON.stringify(decoded)}`);
+
+    // CyberSource embeds the TMS token in various places depending on payment type
+    const tmsToken = decoded.customerTokenId
+      || decoded.paymentToken
+      || decoded.token
+      || decoded.instrumentIdentifier?.id
+      || decoded.jti  // fallback: use the JWT ID as a reference
+      || null;
+
+    if (!tmsToken) {
+      console.warn(`⚠️ [save-subscription] No TMS token found in JWT. Decoded: ${JSON.stringify(decoded)}`);
+      return res.status(400).json({ error: "No customerTokenId found in JWT payload." });
+    }
+
+    const subId = await saveSubscriptionToFirestore({ customerTokenId: tmsToken, planAmount: totalAmount, environment });
+    return res.status(201).json({ message: "Subscription saved.", subscriptionId: subId });
+
   } catch (err) {
-    return res.status(500).json({ error: "Failed to save subscription." });
+    console.error(`❌ [save-subscription] Error:`, err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ROUTE 4: Cancel Subscription
 //  POST /api/cancel-subscription
-//  Body: { subscriptionId }
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.post("/api/cancel-subscription", async (req, res) => {
   const { subscriptionId } = req.body;
+  console.log(`\n📥 [cancel-subscription] id=${subscriptionId}`);
+
   if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId." });
 
   try {
@@ -213,8 +239,10 @@ app.post("/api/cancel-subscription", async (req, res) => {
       status:    "cancelled",
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+    console.log(`🚫 [cancel-subscription] Cancelled: ${subscriptionId}`);
     return res.status(200).json({ message: "Subscription cancelled." });
   } catch (err) {
+    console.error(`❌ [cancel-subscription] Error:`, err.message);
     return res.status(500).json({ error: "Failed to cancel." });
   }
 });
@@ -225,21 +253,20 @@ app.post("/api/cancel-subscription", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.post("/api/run-billing-cycle", async (req, res) => {
-  console.log("🔧 Manual billing cycle triggered.");
+  console.log(`\n🔧 [run-billing-cycle] Manual trigger`);
   const results = await runDailyBillingCycle();
   return res.status(200).json({ message: "Billing cycle complete.", results });
 });
 
 // =============================================================================
 //  MIT SCHEDULER — Daily Subscription Billing
-//  Runs every day at 00:00 Asia/Amman
 // =============================================================================
 
 async function runDailyBillingCycle() {
   const today   = todayString();
   const results = { charged: 0, failed: 0 };
 
-  console.log(`\n⏰ [${new Date().toISOString()}] Billing cycle — checking due subscriptions for ${today}...`);
+  console.log(`\n⏰ [${new Date().toISOString()}] Billing cycle started — due date: ${today}`);
 
   try {
     const snapshot = await db
@@ -261,7 +288,7 @@ async function runDailyBillingCycle() {
       const env   = sub.environment ?? "prod";
       const cfg   = BAE_CONFIG[env];
 
-      console.log(`\n💸 Charging ${subId} — user: ${sub.userId}, amount: ${sub.planAmount} JOD`);
+      console.log(`\n💸 Charging ${subId} — amount: ${sub.planAmount} JOD`);
 
       try {
         const chargeRes = await fetch(cfg.mitUrl, {
@@ -294,7 +321,7 @@ async function runDailyBillingCycle() {
             lastFailureData: errBody,
             updatedAt:       admin.firestore.FieldValue.serverTimestamp(),
           });
-          console.error(`  ❌ Charge failed HTTP ${chargeRes.status} — marked failed.`);
+          console.error(`  ❌ Charge failed HTTP ${chargeRes.status}`);
           results.failed++;
         }
       } catch (chargeErr) {
