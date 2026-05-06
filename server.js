@@ -69,27 +69,6 @@ const futureDateString = (days = 1) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SHARED: Write a subscription record to Firestore
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function saveSubscriptionToFirestore({ customerTokenId, planAmount, environment }) {
-  const subId = "sub_" + Math.random().toString(36).substr(2, 9);
-  await db.collection("subscriptions").doc(subId).set({
-    userId:          subId,
-    customerTokenId,
-    planAmount,
-    currency:        "JOD",
-    status:          "active",
-    environment:     environment || "prod",
-    nextBillingDate: futureDateString(1),  // ← change to 30 for monthly production billing
-    createdAt:       admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt:       admin.firestore.FieldValue.serverTimestamp(),
-  });
-  console.log(`💾 Subscription saved to Firestore: ${subId} | token: ${customerTokenId} | amount: ${planAmount} JOD`);
-  return subId;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  EXPRESS APP
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -132,6 +111,9 @@ app.post("/api/capture-context", async (req, res) => {
 //  ROUTE 2: Process Final Payment (standard card / 3DS path)
 //  POST /api/process-payment
 //  Body: { transientToken, environment, isSubscription, totalAmount }
+//
+//  The BAE /hostedCheckout response contains the customerTokenId (TMS token)
+//  which is the reusable token for future MIT charges on standard cards.
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.post("/api/process-payment", async (req, res) => {
@@ -154,20 +136,32 @@ app.post("/api/process-payment", async (req, res) => {
     // ── Save to Firestore if this is a subscription ───────────────────────────
     if (isSubscription && baeRes.ok) {
       try {
-        const parsed   = JSON.parse(rawData);
-        // Log all keys so we can see exactly what BAE returns
+        const parsed = JSON.parse(rawData);
         console.log(`🔍 [process-payment] BAE response keys: ${Object.keys(parsed).join(", ")}`);
 
-        const tmsToken = parsed.customerTokenId
+        // TMS token from BAE hostedCheckout (standard card path)
+        const customerTokenId = parsed.customerTokenId
           || parsed.paymentToken
           || parsed.token
-          || parsed.instrumentIdentifier?.id
           || null;
 
-        if (tmsToken) {
-          await saveSubscriptionToFirestore({ customerTokenId: tmsToken, planAmount: totalAmount, environment });
+        if (customerTokenId) {
+          const subId = "sub_" + Math.random().toString(36).substr(2, 9);
+          await db.collection("subscriptions").doc(subId).set({
+            userId:           subId,
+            customerTokenId,                   // reusable TMS token for MIT
+            tokenType:        "TMS",
+            planAmount:       totalAmount,
+            currency:         "JOD",
+            status:           "active",
+            environment,
+            nextBillingDate:  futureDateString(1), // ← change to 30 for production
+            createdAt:        admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt:        admin.firestore.FieldValue.serverTimestamp(),
+          });
+          console.log(`💾 [process-payment] Subscription saved: ${subId} | TMS token: ${customerTokenId}`);
         } else {
-          console.warn(`⚠️ [process-payment] No token field found in BAE response. Cannot save subscription.`);
+          console.warn(`⚠️ [process-payment] No customerTokenId in BAE response. Keys: ${Object.keys(parsed).join(", ")}`);
         }
       } catch (e) {
         console.error(`❌ [process-payment] Firestore save error:`, e.message);
@@ -182,11 +176,19 @@ app.post("/api/process-payment", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ROUTE 3: Save Subscription (wallet / auto-authorized path)
-//  Called by frontend when Google Pay or Apple Pay auto-authorizes.
-//  The completeResult JWT from up.complete() is decoded server-side.
+//  ROUTE 3: Save Wallet Subscription (Google Pay / Apple Pay path)
 //  POST /api/save-subscription
 //  Body: { completeResultJwt, totalAmount, environment }
+//
+//  IMPORTANT ARCHITECTURE NOTE:
+//  Wallet payments (Google Pay / Apple Pay) do NOT return a reusable TMS token
+//  inside the up.complete() JWT. Instead they return a transaction receipt with:
+//    - id:                                    the CyberSource transaction ID
+//    - details.processorInformation.networkTransactionId: the network MIT reference
+//
+//  For CyberSource MIT, the networkTransactionId from the original CIT is the
+//  reference used in subsequent charges — not a TMS customerTokenId.
+//  ⚠️ Confirm with BAE what the exact MIT payload looks like for wallet tokens.
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.post("/api/save-subscription", async (req, res) => {
@@ -194,27 +196,48 @@ app.post("/api/save-subscription", async (req, res) => {
   console.log(`\n📥 [save-subscription] env=${environment} amount=${totalAmount}`);
 
   try {
-    // Decode the JWT payload (second segment)
-    const payloadB64  = completeResultJwt.split(".")[1];
-    const decoded     = JSON.parse(Buffer.from(payloadB64, "base64").toString("utf8"));
+    const payloadB64 = completeResultJwt.split(".")[1];
+    const decoded    = JSON.parse(Buffer.from(payloadB64, "base64").toString("utf8"));
 
     console.log(`🔍 [save-subscription] Decoded JWT keys: ${Object.keys(decoded).join(", ")}`);
-    console.log(`🔍 [save-subscription] Full decoded payload: ${JSON.stringify(decoded)}`);
 
-    // CyberSource embeds the TMS token in various places depending on payment type
-    const tmsToken = decoded.customerTokenId
-      || decoded.paymentToken
-      || decoded.token
-      || decoded.instrumentIdentifier?.id
-      || decoded.jti  // fallback: use the JWT ID as a reference
-      || null;
+    // ── Extract available identifiers from the wallet authorization receipt ───
+    const transactionId      = decoded.id || null;
+    const networkTxnId       = decoded.details?.processorInformation?.networkTransactionId || null;
+    const reconciliationId   = decoded.reconciliationId || null;
+    const approvalCode       = decoded.details?.processorInformation?.approvalCode || null;
+    const cardType           = decoded.details?.paymentInformation?.card?.type || null;
 
-    if (!tmsToken) {
-      console.warn(`⚠️ [save-subscription] No TMS token found in JWT. Decoded: ${JSON.stringify(decoded)}`);
-      return res.status(400).json({ error: "No customerTokenId found in JWT payload." });
+    console.log(`🔍 [save-subscription] transactionId=${transactionId} networkTxnId=${networkTxnId}`);
+
+    if (!transactionId && !networkTxnId) {
+      console.warn(`⚠️ [save-subscription] No usable token identifiers found.`);
+      return res.status(400).json({ error: "No usable token found in wallet JWT." });
     }
 
-    const subId = await saveSubscriptionToFirestore({ customerTokenId: tmsToken, planAmount: totalAmount, environment });
+    // ── Save to Firestore with all available references ──────────────────────
+    const subId = "sub_" + Math.random().toString(36).substr(2, 9);
+    await db.collection("subscriptions").doc(subId).set({
+      userId:            subId,
+      // For wallet payments: use networkTransactionId as the MIT reference
+      // (confirm exact MIT payload format with BAE before going live)
+      customerTokenId:   networkTxnId || transactionId,
+      tokenType:         "NETWORK_TXN_ID",   // distinguishes from TMS token
+      transactionId,
+      networkTxnId,
+      reconciliationId,
+      approvalCode,
+      cardType,
+      planAmount:        totalAmount,
+      currency:          "JOD",
+      status:            "active",
+      environment,
+      nextBillingDate:   futureDateString(1), // ← change to 30 for production
+      createdAt:         admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt:         admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log(`💾 [save-subscription] Wallet subscription saved: ${subId} | networkTxnId: ${networkTxnId}`);
     return res.status(201).json({ message: "Subscription saved.", subscriptionId: subId });
 
   } catch (err) {
@@ -231,7 +254,6 @@ app.post("/api/save-subscription", async (req, res) => {
 app.post("/api/cancel-subscription", async (req, res) => {
   const { subscriptionId } = req.body;
   console.log(`\n📥 [cancel-subscription] id=${subscriptionId}`);
-
   if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId." });
 
   try {
@@ -260,6 +282,7 @@ app.post("/api/run-billing-cycle", async (req, res) => {
 
 // =============================================================================
 //  MIT SCHEDULER — Daily Subscription Billing
+//  Runs every day at 00:00 Asia/Amman
 // =============================================================================
 
 async function runDailyBillingCycle() {
@@ -288,7 +311,7 @@ async function runDailyBillingCycle() {
       const env   = sub.environment ?? "prod";
       const cfg   = BAE_CONFIG[env];
 
-      console.log(`\n💸 Charging ${subId} — amount: ${sub.planAmount} JOD`);
+      console.log(`\n💸 Charging ${subId} | tokenType=${sub.tokenType} | amount=${sub.planAmount} JOD`);
 
       try {
         const chargeRes = await fetch(cfg.mitUrl, {
@@ -304,6 +327,8 @@ async function runDailyBillingCycle() {
           }),
         });
 
+        const chargeBody = await chargeRes.text();
+
         if (chargeRes.ok) {
           const nextBillingDate = futureDateString(1); // ← change to 30 for production
           await db.collection("subscriptions").doc(subId).update({
@@ -314,14 +339,13 @@ async function runDailyBillingCycle() {
           console.log(`  ✅ Charged. Next billing: ${nextBillingDate}`);
           results.charged++;
         } else {
-          const errBody = await chargeRes.text();
           await db.collection("subscriptions").doc(subId).update({
             status:          "failed",
             lastFailureCode: String(chargeRes.status),
-            lastFailureData: errBody,
+            lastFailureData: chargeBody,
             updatedAt:       admin.firestore.FieldValue.serverTimestamp(),
           });
-          console.error(`  ❌ Charge failed HTTP ${chargeRes.status}`);
+          console.error(`  ❌ Charge failed HTTP ${chargeRes.status}: ${chargeBody}`);
           results.failed++;
         }
       } catch (chargeErr) {
